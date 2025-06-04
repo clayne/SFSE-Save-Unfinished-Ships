@@ -170,7 +170,8 @@ static void OnDelayLoad()
     if (!SetupLog())
         return;
 
-    Log("Module base @ 0x{:X}", reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr)));
+    Global::moduleBase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    Log("Module base @ 0x{:X}", Global::moduleBase);
 
     if (!InitCapstone())
         return;

@@ -49,4 +49,6 @@ namespace Global
     inline int maxShipModulesPrev;
     inline int* maxShipModulesPtr;
 
+    inline uintptr_t moduleBase;
+
 }

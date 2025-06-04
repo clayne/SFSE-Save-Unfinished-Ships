@@ -38,42 +38,29 @@ bool FindPatchingTargets()
         const auto followingRetIntInsn = PatternScanFromStartExact({ 0xC3, 0xCC }, stringRef, 0x10000);
         const auto insns = dis.Disasm(stringRef, followingRetIntInsn - stringRef, reinterpret_cast<size_t>(stringRef));
 
-        std::vector<string> instructionSignature = { "mov", "lea", "call" };
-
         bool foundAddr = false;
-        for (size_t i = 0; i < insns->Count - instructionSignature.size(); ++i)
+        for (size_t i = 0; i < min(insns->Count - 1, 50); ++i)
         {
             const auto curInsn = insns->Instructions(i);
 
-            bool found = true;
-            for (size_t j = 0; j < instructionSignature.size(); ++j)
+            if (string(curInsn->mnemonic) != "mov") continue;
+            if (curInsn->detail->x86.op_count != 2) continue;
+
+            const auto movSrc = curInsn->detail->x86.operands[1];
+            if (!(movSrc.type == X86_OP_IMM && movSrc.imm == 2)) continue; // "2" is the right-hand operand of the mov instruction
+
+            const auto insnAddr = reinterpret_cast<byte*>(curInsn->address);
+            const auto insnOffset = reinterpret_cast<uintptr_t>(insnAddr) - Global::moduleBase;
+            const auto byteAmount = curInsn->size;
+            const auto patchTargetAddr = insnAddr + byteAmount - 1;
+
+            if (*patchTargetAddr != 0x02)
             {
-                if (string(insns->Instructions(i + j)->mnemonic) == instructionSignature[j])
-                    continue;
-
-                found = false;
-                break;
-            }
-
-            if (!found)
-                continue;
-
-            /* Patching mov dl, 2 (B2 02) opcodes to change errors into warnings */
-
-            std::vector<byte> patch = { 0xB2, 0x01 }; // mov dl, 1
-
-            const auto insn = insns->Instructions(i);
-            const auto insnAddr = reinterpret_cast<byte*>(insn->address);
-
-            if (!(*insnAddr == 0xB2 && *(insnAddr + 1) == 0x02))
-            {
-                Log("Unexpected opcodes 0x{:X} ({})", reinterpret_cast<uintptr_t>(insnAddr), targetStringRef);
+                Log("Unexpected opcodes 0x{:X} (base+0x{:X}) ({})", reinterpret_cast<uintptr_t>(insnAddr), insnOffset, targetStringRef);
                 return false;
             }
 
-            const auto byteAmount = patch.size();
-
-            Log("Found address to patch at 0x{:X} ({})", reinterpret_cast<uintptr_t>(insnAddr), targetStringRef);
+            Log("Found address to patch @ 0x{:X} (base+0x{:X}) ({})", reinterpret_cast<uintptr_t>(insnAddr), insnOffset, targetStringRef);
 
             string fromBytes = "";
             string toBytes = "";
@@ -81,24 +68,20 @@ bool FindPatchingTargets()
             {
                 auto addr = insnAddr + i;
                 fromBytes += std::format("{:02X}", *addr);
-                toBytes += std::format("{:02X}", patch.at(i));
                 const auto isLastByte = i == byteAmount - 1;
+                toBytes += std::format("{:02X}", isLastByte ? 0x01 : *addr);
                 if (!isLastByte)
                 {
                     fromBytes += " ";
                     toBytes += " ";
                 }
             }
-            Log("-> {} will be replaced with {}", fromBytes, toBytes);
+            Log("-> {} ({}) will be replaced with {}", fromBytes, std::format("{} {}", curInsn->mnemonic, curInsn->op_str), toBytes);
 
-            for (auto i = 0; i < byteAmount; ++i)
-            {
-                auto addr = insnAddr + i;
-                Global::targetAddresses.try_emplace(addr, std::make_pair(*addr, patch.at(i)));
-            }
+            Global::targetAddresses.try_emplace(patchTargetAddr, std::make_pair(*patchTargetAddr, 0x01));
 
             foundAddr = true;
-            break;
+            // there can now be multiple relevant mov instructions, so no break here
         }
 
         if (!foundAddr)
@@ -116,11 +99,45 @@ bool FindGlobals()
     Log("Searching globals...");
 
     {
+        /* maxShipModules */
+
         const auto stringRef = FindStringReferenceA("$SB_ERRORBODY_DUPLICATION_EXCEEDED");
-        const auto previousRetIntInsn = PatternScanExactReverse({ 0xC3, 0xCC }, stringRef, 0x1000);
+        auto previousRetIntInsn = PatternScanExactReverse({ 0xC3, 0xCC }, stringRef, 0x1000);
 
-        const auto insns = dis.Disasm(previousRetIntInsn, stringRef - previousRetIntInsn, reinterpret_cast<size_t>(previousRetIntInsn));
+        auto insns = dis.Disasm(previousRetIntInsn, stringRef - previousRetIntInsn, reinterpret_cast<size_t>(previousRetIntInsn));
 
+        byte* funcAddr = nullptr;
+        for (size_t i = 1; i < insns->Count; ++i)
+        {
+            const auto insn = insns->Instructions(i);
+            if (string(insn->mnemonic) == "int3") continue; // skip alignment
+
+        	funcAddr = reinterpret_cast<byte*>(insn->address);
+            const auto funcOffset = insn->address - Global::moduleBase;
+            Log("Found function ($SB_ERRORBODY_DUPLICATION_EXCEEDED) @ 0x{:X} (base+0x{:X})", reinterpret_cast<uintptr_t>(funcAddr), funcOffset);
+            break;
+        }
+
+        if (!funcAddr)
+        {
+            Log("Couldn't find maxShipModules global");
+            return false;
+        }
+
+        const auto jmpRef = FindJmpReferenceToAddress(funcAddr);
+
+        if (!jmpRef)
+        {
+            Log("Couldn't find maxShipModules global");
+            return false;
+        }
+
+        Log("Found function ref @ 0x{:X} (base+0x{:X})", reinterpret_cast<uintptr_t>(jmpRef), reinterpret_cast<uintptr_t>(jmpRef) - Global::moduleBase);
+
+        previousRetIntInsn = PatternScanExactReverse({ 0xC3, 0xCC }, jmpRef, 0x1000);
+        insns = dis.Disasm(previousRetIntInsn, jmpRef - previousRetIntInsn, reinterpret_cast<size_t>(previousRetIntInsn));
+
+        bool found = false;
         for (size_t i = insns->Count - 1; i > 0; --i)
         {
             const auto curInsn = insns->Instructions(i);
@@ -134,61 +151,93 @@ bool FindGlobals()
 
             Global::maxShipModulesPtr = reinterpret_cast<int*>(curInsn->address + curInsn->size + curInsn->detail->x86.disp);
 
-            Log("Found maxShipModules @ 0x{:X}", reinterpret_cast<uintptr_t>(Global::maxShipModulesPtr));
-            return true;
+            const auto offset = reinterpret_cast<uintptr_t>(Global::maxShipModulesPtr) - Global::moduleBase;
+            Log("Found maxShipModules @ 0x{:X} (base+0x{:X})", reinterpret_cast<uintptr_t>(Global::maxShipModulesPtr), offset);
+            found = true;
+            break;
         }
 
-        Log("Couldn't find maxShipModules global");
+        if (!found)
+        {
+            Log("Couldn't find maxShipModules global");
+            return false;
+        }
     }
 
-    return false;
+    {
+        /* scaleformManagerPtr */
+
+        const auto stringRef = FindStringReferenceA("REFR %s is at ");
+        if (!stringRef)
+        {
+            Log("Failed to find target string reference ({})", R"("REFR %s is at ")");
+            return false;
+        }
+
+        const auto previousRetIntInsn = PatternScanExactReverse({ 0xC3, 0xCC }, stringRef, 0x1000);
+        const auto insns = dis.Disasm(previousRetIntInsn, stringRef - previousRetIntInsn, reinterpret_cast<size_t>(stringRef));
+
+        bool found = false;
+        for (size_t i = 1; i < insns->Count; ++i)
+        {
+            const auto insn = insns->Instructions(i);
+
+            if (!(string(insn->mnemonic) == "mov"
+                && string(insns->Instructions(i + 1)->mnemonic) == "add")) continue;
+
+            if (string(insn->op_str).find("rip") == string::npos) continue;
+
+            Global::scaleformManagerPtr = reinterpret_cast<void**>(insn->address + insn->size + insn->detail->x86.disp);
+            const auto offset = reinterpret_cast<uintptr_t>(Global::scaleformManagerPtr) - Global::moduleBase;
+            Log("Found global scaleformManagerPtr @ 0x{:X} (base+0x{:X})", reinterpret_cast<uintptr_t>(Global::scaleformManagerPtr), offset);
+            found = true;
+            break;
+        }
+        if (!found)
+        {
+            Log("Failed to find global (scaleformManagerPtr)");
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool FindFunctions()
 {
     Log("Searching function addresses...");
 
-    const auto stringRef = FindStringReferenceA("SaveLoadTester Step");
-    if (!stringRef)
     {
-        Log("Failed to find target string reference");
-        return false;
+	    /* ExecuteCommand */
+
+        const auto stringRef = FindStringReferenceA("float fresult\nref refr\nset refr to GetSelectedRef\nset fresult to ");
+        if (!stringRef)
+        {
+            Log("Failed to find target string reference ({})", R"("float fresult\nref refr\nset refr to GetSelectedRef\nset fresult to ")");
+            return false;
+        }
+
+        const auto previousRetIntInsn = PatternScanExactReverse({ 0xC3, 0xCC }, stringRef, 0x1000);
+        const auto insns = dis.Disasm(previousRetIntInsn, stringRef - previousRetIntInsn, reinterpret_cast<size_t>(previousRetIntInsn));
+
+        bool found = false;
+        for (size_t i = 1; i < insns->Count; ++i)
+        {
+            const auto insn = insns->Instructions(i);
+            if (string(insn->mnemonic) == "int3") continue;
+
+            Global::executeCommandPtr = reinterpret_cast<void*>(insn->address);
+            const auto offset = reinterpret_cast<uintptr_t>(Global::executeCommandPtr) - Global::moduleBase;
+            Log("Found ExecuteCommand @ 0x{:X} (base+0x{:X})", reinterpret_cast<uintptr_t>(Global::executeCommandPtr), offset);
+            found = true;
+            break;
+        }
+        if (!found)
+        {
+            Log("Failed to find function (ExecuteCommand)");
+            return false;
+        }
     }
-
-    const auto followingIntInsn = PatternScanFromStartExact({ 0xC3, 0xCC }, stringRef, 0x1000);
-    if (!followingIntInsn)
-    {
-        Log("Failed to find function end");
-        return false;
-    }
-
-    const auto insns = dis.Disasm(stringRef, followingIntInsn - stringRef, reinterpret_cast<size_t>(stringRef));
-
-    for (size_t i = 0; i < insns->Count; ++i)
-    {
-        const bool isTargetInsn =
-            string(insns->Instructions(i)->mnemonic) == "call"
-            && string(insns->Instructions(i + 1)->mnemonic) == "mov"
-            && string(insns->Instructions(i + 2)->mnemonic) == "mov"
-            && string(insns->Instructions(i + 3)->mnemonic) == "call";
-        if (!isTargetInsn)
-            continue;
-
-        const auto scaleFormManagerPtrInsn = insns->Instructions(i + 2);
-        const auto executeCommandInsn = insns->Instructions(i + 3);
-
-        Global::scaleformManagerPtr = reinterpret_cast<void**>(scaleFormManagerPtrInsn->address + 7 + scaleFormManagerPtrInsn->detail->x86.disp);
-        Global::executeCommandPtr = reinterpret_cast<void*>(executeCommandInsn->detail->x86.operands[0].imm);
-        break;
-    }
-
-    if (!Global::scaleformManagerPtr || !Global::executeCommandPtr)
-    {
-        Log("Failed to find function address");
-        return false;
-    }
-
-    Log("Found ExecuteCommand @ 0x{:X}", reinterpret_cast<uintptr_t>(Global::executeCommandPtr));
 
     return true;
 }

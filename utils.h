@@ -4,7 +4,7 @@
 
 inline std::tuple<byte*, uint32_t> GetSectionInfo(const string& section)
 {
-    const auto moduleBase = GetModuleHandleA(nullptr);
+    const auto moduleBase = Global::moduleBase;
     const auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(moduleBase);
     const auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<byte*>(moduleBase) + dosHeader->e_lfanew);
 
@@ -214,6 +214,30 @@ inline byte* FindStringReferenceA(const string& text)
     const auto refAddr = FindLeaReferenceToAddress(stringAddr);
 
     return refAddr;
+}
+
+inline byte* FindJmpReferenceToAddress(const byte* address)
+{
+    constexpr auto jmpInsnSize = 5;
+
+    const auto& [sectionStart, sectionSize] = GetSectionInfo(".text");
+
+    for (auto curPtr = sectionStart; curPtr < sectionStart + sectionSize - jmpInsnSize; ++curPtr)
+    {
+        const auto isJmpOpcode = *curPtr == 0xE9;
+        if (!isJmpOpcode)
+            continue;
+
+        const auto ripOffset = *reinterpret_cast<uint32_t*>(curPtr + jmpInsnSize - sizeof(uint32_t));
+        const byte* referencedAddress = curPtr + ripOffset + jmpInsnSize;
+
+        if (referencedAddress != address)
+            continue;
+
+        return curPtr;
+    }
+
+    return nullptr;
 }
 
 template <typename T>
